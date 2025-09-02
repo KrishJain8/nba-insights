@@ -1,4 +1,4 @@
-# stattwins.py — NBA "Statistical Twins" via cosine similarity (interactive, accent-insensitive)
+# twins.py — finding similar NBA players based on statistics using cosine similarity
 
 import pandas as pd
 from nba_api.stats.endpoints import leaguedashplayerstats
