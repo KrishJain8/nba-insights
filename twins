@@ -1,0 +1,217 @@
+# stattwins.py — NBA "Statistical Twins" via cosine similarity (interactive, accent-insensitive)
+
+import pandas as pd
+from nba_api.stats.endpoints import leaguedashplayerstats
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import unicodedata
+
+SEASON = "2023-24"  # Use a completed season first; switch to "2024-25" later
+
+# ---------- helpers ----------
+def fetch(season: str, per_mode: str, measure: str) -> pd.DataFrame:
+    """Fetch LeagueDashPlayerStats for a given per_mode and measure type."""
+    return leaguedashplayerstats.LeagueDashPlayerStats(
+        season=season,
+        season_type_all_star="Regular Season",
+        per_mode_detailed=per_mode,      # "PerGame" | "Per100Possessions"
+        league_id_nullable="00",         # NBA
+        measure_type_detailed_defense=measure  # "Base" | "Advanced" | "Usage"
+    ).get_data_frames()[0]
+
+def normalize_name(name: str) -> str:
+    """Lowercase + strip accents/diacritics so 'Jokić' → 'jokic'."""
+    if not isinstance(name, str):
+        return ""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", name)
+        if unicodedata.category(c) != "Mn"
+    ).lower().strip()
+
+# -----------------------------
+# 1) Pull PerGame for filtering
+# -----------------------------
+pergame = fetch(SEASON, "PerGame", "Base")[[
+    "PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "GP", "MIN"
+]].copy()
+pergame["TOTAL_MIN"] = pergame["GP"] * pergame["MIN"]
+
+# ---------------------------------------------
+# 2) Pull Per100 Base / Advanced / Usage tables
+# ---------------------------------------------
+base   = fetch(SEASON, "Per100Possessions", "Base")
+adv    = fetch(SEASON, "Per100Possessions", "Advanced")
+usage  = fetch(SEASON, "Per100Possessions", "Usage")
+
+# ------------------------------------------------------------
+# 3) Define desired columns, but keep only those that exist
+# ------------------------------------------------------------
+base_wanted  = ["PLAYER_ID", "PTS", "STL", "BLK", "FG3A", "FTA", "FG3M"]  # FG3M optional
+adv_wanted   = [
+    "PLAYER_ID",
+    "TS_PCT", "EFG_PCT", "USG_PCT",
+    "AST_PCT",
+    "OREB_PCT", "DREB_PCT", "REB_PCT",
+    "AST_TO", "AST_RATIO", "TOV_PCT"   # some may be missing season-to-season
+]
+usage_wanted = [
+    "PLAYER_ID",
+    "PCT_FGA_3PT", "PCT_PTS_FT", "PCT_PTS_2PT", "PCT_PTS_3PT"  # some may be missing
+]
+
+base_keep   = [c for c in base_wanted  if c in base.columns]
+adv_keep    = [c for c in adv_wanted   if c in adv.columns]
+usage_keep  = [c for c in usage_wanted if c in usage.columns]
+
+# ----------------------------------------
+# 4) Build the feature frame robustly
+# ----------------------------------------
+df = base[base_keep].copy()
+df = df.merge(adv[adv_keep],     on="PLAYER_ID", how="left")
+df = df.merge(usage[usage_keep], on="PLAYER_ID", how="left")
+df = df.merge(pergame[["PLAYER_ID","PLAYER_NAME","TEAM_ABBREVIATION","GP","MIN","TOTAL_MIN"]],
+              on="PLAYER_ID", how="left")
+
+# ----------------------------------------
+# 5) Rotation filter (tweak thresholds)
+# ----------------------------------------
+MIN_GAMES = 20
+MIN_MPG   = 10
+MIN_TMIN  = 300
+
+pool = df[((df["GP"] >= MIN_GAMES) | (df["TOTAL_MIN"] >= MIN_TMIN)) &
+          (df["MIN"] >= MIN_MPG)].copy()
+
+# If early season or too strict, relax a bit
+if len(pool) == 0:
+    pool = df[((df["GP"] >= 10) | (df["TOTAL_MIN"] >= 150)) &
+              (df["MIN"] >= 8)].copy()
+
+# Reset index (aligns with cosine matrix indices)
+pool = pool.reset_index(drop=True)
+
+# Add normalized name for accent-insensitive matching/search
+pool["NAME_NORMALIZED"] = pool["PLAYER_NAME"].apply(normalize_name)
+
+# -------------------------------------------------
+# 6) Final feature list (use only columns we have)
+# -------------------------------------------------
+desired_features = [
+    # Base per100 shape
+    "PTS", "STL", "BLK", "FG3A", "FG3M", "FTA",
+    # Efficiency & creation
+    "TS_PCT", "EFG_PCT", "USG_PCT", "AST_PCT",
+    # Turnover / passing style if available
+    "AST_TO", "AST_RATIO", "TOV_PCT",
+    # Rebounding profile
+    "REB_PCT", "OREB_PCT", "DREB_PCT",
+    # Shot mix / pressure (if kept from Usage)
+    "PCT_FGA_3PT", "PCT_PTS_FT", "PCT_PTS_2PT", "PCT_PTS_3PT"
+]
+features = [f for f in desired_features if f in pool.columns]
+if len(features) < 8:
+    raise SystemExit(f"Too few features available ({len(features)}). Available: {features}")
+
+# ------------------------------
+# 7) Clean, scale, cosine sim
+# ------------------------------
+pool[features] = (pool[features]
+                  .astype(float)
+                  .replace([np.inf, -np.inf], np.nan)
+                  .fillna(pool[features].median()))
+
+X = StandardScaler().fit_transform(pool[features])
+cos_sim = cosine_similarity(X)  # N x N aligned to pool's 0..N-1 indices
+
+# --------------------------------------------
+# 8) Helpers: search + twins (positional-safe)
+# --------------------------------------------
+def search_player(query: str, limit: int = 20) -> pd.DataFrame:
+    """Case-insensitive, accent-insensitive contains search over player names."""
+    q = normalize_name(query)
+    hits = pool[pool["NAME_NORMALIZED"].str.contains(q)]
+    return hits[["PLAYER_NAME","TEAM_ABBREVIATION","GP","MIN"]].sort_values("PLAYER_NAME").head(limit)
+
+def find_twins(player_name: str, top_n: int = 10, min_gp: int = 20, include_if_below: bool = True) -> pd.DataFrame:
+    """
+    Find 'statistical twins' by cosine similarity on standardized features.
+    - min_gp: threshold for the comparison subset
+    - include_if_below: if target is below min_gp, include them anyway
+    """
+    q = normalize_name(player_name)
+    hits = pool.index[pool["NAME_NORMALIZED"] == q]
+    if len(hits) == 0:
+        return pd.DataFrame({"note": [f'"{player_name}" not found. Try :search <text> to locate exact spelling.']})
+    i_full = int(hits[0])  # positional index in pool (0..N-1)
+
+    # build subset of positions by GP threshold
+    mask = (pool["GP"] >= min_gp)
+    sub_pos = [i for i, ok in enumerate(mask) if ok]
+
+    # include target even if below threshold
+    if i_full not in sub_pos:
+        if not include_if_below:
+            return pd.DataFrame({"note": [f'"{player_name}" has GP<{min_gp}.']})
+        sub_pos.append(i_full)
+
+    sub_cos = cos_sim[np.ix_(sub_pos, sub_pos)]
+    i_pos = sub_pos.index(i_full)
+
+    names = pool.loc[sub_pos, "PLAYER_NAME"].tolist()
+    teams = pool.loc[sub_pos, "TEAM_ABBREVIATION"].tolist()
+
+    sims = pd.Series(sub_cos[i_pos], index=range(len(sub_pos)))
+    sims = sims.drop(i_pos, errors="ignore")
+
+    order = sims.sort_values(ascending=False).head(top_n).index.tolist()
+    out = pd.DataFrame({
+        "Twin": [names[j] for j in order],
+        "TEAM": [teams[j] for j in order],
+        "Similarity": sims.loc[order].round(3).values
+    })
+    return out.reset_index(drop=True)
+
+# ----------------------------
+# 9) Simple interactive CLI
+# ----------------------------
+if __name__ == "__main__":
+    print(f"\nNBA Statistical Twins — Season {SEASON}")
+    print(f"Players in pool: {len(pool)}")
+    print(f"Features used ({len(features)}): {features}\n")
+    print("Type a player name (accents optional) to get their top 10 statistical twins.")
+    print("Commands: ':search <text>' to find names, ':gp <N>' to set min games (default 20), ':quit' to exit.\n")
+
+    current_min_gp = 20
+
+    while True:
+        try:
+            cmd = input(f"[min_gp={current_min_gp}] Enter player or command: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye!")
+            break
+
+        if not cmd:
+            continue
+        if cmd.lower() in (":q", ":quit", "quit", "exit"):
+            break
+        if cmd.lower().startswith(":search "):
+            q = cmd[8:]
+            res = search_player(q)
+            if res.empty:
+                print("No matches.")
+            else:
+                print(res.to_string(index=False))
+            continue
+        if cmd.lower().startswith(":gp "):
+            parts = cmd.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                current_min_gp = int(parts[1])
+                print(f"min_gp set to {current_min_gp}")
+            else:
+                print("Usage: :gp 15   (integer)")
+            continue
+
+        # treat as player name
+        result = find_twins(cmd, top_n=10, min_gp=current_min_gp, include_if_below=True)
+        print(result.to_string(index=False))
